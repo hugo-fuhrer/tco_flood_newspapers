@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+flood_env/
+.venv/
+
+# Data
+data/raw/
+data/processed/
+
+# Compiled DSPy programs (produced by src/optimize.py)
+artifacts/
+
+# Environment
+.env
+requirements.txt
