@@ -112,6 +112,23 @@ def split(examples: list, dev_frac: float, seed: int):
     return shuffled[n_dev:], shuffled[:n_dev]
 
 
+def truncate_demos(examples: list, max_chars: int) -> list:
+    """Shorten each example's article_text so baked-in demos stay compact.
+
+    Few-shot demos are sent on every inference call, so long demo articles
+    dominate the prompt. Truncating them cuts tokens/latency at inference; the
+    eval/dev set is left untouched so accuracy is measured on full text.
+    """
+    if not max_chars:
+        return examples
+    out = []
+    for ex in examples:
+        data = {k: (v[:max_chars] if k == "article_text" and isinstance(v, str) else v)
+                for k, v in ex.items()}
+        out.append(dspy.Example(**data).with_inputs(*ex.inputs().keys()))
+    return out
+
+
 def flood_metric(example, pred, trace=None) -> bool:
     return bool(getattr(pred, "flood_mentioned", None)) == bool(example.flood)
 
@@ -127,8 +144,10 @@ def optimize_filter(name, signature, metric, examples, args):
         return None
 
     train, dev = split(examples, args.dev_frac, args.seed)
+    train = truncate_demos(train, args.max_demo_chars)
     print(f"\n=== Optimizing {name} filter ===")
-    print(f"  examples={len(examples)}  train={len(train)}  dev={len(dev)}")
+    print(f"  examples={len(examples)}  train={len(train)}  dev={len(dev)}"
+          f"  max_demo_chars={args.max_demo_chars}")
 
     program = dspy.Predict(signature)
     evaluate = dspy.Evaluate(
@@ -171,6 +190,8 @@ def main():
     parser.add_argument("--max-demos", type=int, default=4, help="max_bootstrapped_demos")
     parser.add_argument("--max-labeled-demos", type=int, default=16, help="max_labeled_demos")
     parser.add_argument("--max-rounds", type=int, default=1, help="BootstrapFewShot rounds")
+    parser.add_argument("--max-demo-chars", type=int, default=None,
+                        help="Truncate each demo's article_text to this many chars (cuts inference tokens)")
     parser.add_argument("--num-threads", type=int, default=1, help="Eval threads")
     args = parser.parse_args()
 

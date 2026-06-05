@@ -72,26 +72,28 @@ class FloodExtraction(dspy.Signature):
     """Extract structured data about an Ontario flood event from a news article.
 
     The article has already been verified to describe a real flood that occurred
-    in Ontario. Extract only information that is explicitly stated or directly
-    implied by the text. Do NOT invent details.
+    in Ontario. Extract ONLY what the article itself states. Do NOT invent,
+    guess, or infer details from outside knowledge.
 
-    Guidelines:
-    - Use the most specific information available; if a field is genuinely not
-      stated, return "unknown" rather than guessing.
-    - Preserve dates as written in the article (e.g., "March 1954", "to-day"),
-      but normalise to a clear form where possible (e.g., "1954-03").
-    - For location, give the Ontario place name(s) the flood affected (city,
-      town, river, or watershed).
+    Output rules (important):
+    - Each field is a SHORT value only — no sentences, no explanations, no
+      parenthetical notes, no markdown, no headings.
+    - If the article does not state a field, output exactly: unknown
+    - Never copy values from these instructions; read them from the article.
     """
 
-    article: str = dspy.InputField(desc="Cleaned full text of an Ontario flood article")
+    article: str = dspy.InputField(desc="Full text of an Ontario flood article")
 
     date: str = dspy.OutputField(
-        desc="When the flood occurred, as stated in the article (e.g., '1954-03', 'spring 1937'). 'unknown' if not stated."
+        desc="When the flood occurred, taken only from the article's own words "
+             "(a year, a year-month like YYYY-MM, or a season+year). Do not infer "
+             "from context. Output 'unknown' if the article gives no date."
     )
     location: str = dspy.OutputField(
-        desc="Ontario place(s) affected by the flood: city/town, river, or watershed. 'unknown' if not stated."
+        desc="Ontario place(s) the flood affected (city/town, river, or watershed) "
+             "as named in the article. Comma-separated if several. 'unknown' if not stated."
     )
     intensity: str = dspy.OutputField(
-        desc="Severity of the flood and its impact (e.g., damage, casualties, displacement, water levels) as described in the article. 'unknown' if not stated."
+        desc="A few words on the flood's severity/impact (e.g. deaths, damage, "
+             "evacuations, water levels) as stated in the article. 'unknown' if not stated."
     )
