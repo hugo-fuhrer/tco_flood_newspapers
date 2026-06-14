@@ -50,15 +50,37 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
+import os
 import random
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import dspy
+# --- Network-restricted environment (TDM) -----------------------------------
+# TDM blocks outbound internet, so LiteLLM must NOT try to fetch its remote
+# model-cost map (the "[Errno 101] Network is unreachable" warning). Force the
+# local backup BEFORE importing dspy/litellm, and quiet the import-time chatter.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_LOG", "ERROR")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import dspy  # noqa: E402
+from dspy.adapters.base import Adapter  # noqa: E402
+
+try:  # belt-and-suspenders: silence LiteLLM and let it drop unknown params
+    import litellm
+
+    litellm.suppress_debug_info = True
+    litellm.drop_params = True  # so reasoning_effort/verbosity never hard-error
+    litellm.telemetry = False
+except Exception:
+    pass
 
 # ----------------------------------------------------------------------------
 # Paths (defaults mirror the rest of the repo; override on the CLI for TDM).
@@ -136,9 +158,14 @@ def canonical_model(name: str) -> str:
 
 
 def is_reasoning_model(model: str) -> bool:
-    """o-series and gpt-5 behave like reasoning models (no temperature=0, etc.)."""
-    m = model.lower()
-    return m.startswith("o1") or m.startswith("o3") or m.startswith("o4") or m.startswith("gpt-5")
+    """o-series and gpt-5 (but NOT gpt-5-chat) are reasoning models: temperature
+    must be 1, max_tokens >= 16000, and DSPy maps max_tokens ->
+    max_completion_tokens. This mirrors dspy.LM's own detection so we never trip
+    its validation."""
+    m = model.split("/")[-1].lower()
+    if m.startswith("gpt-5") and not m.startswith("gpt-5-chat"):
+        return True
+    return bool(re.match(r"^o[1345](?:-(?:mini|nano|pro))?(?:-\d{4}-\d{2}-\d{2})?$", m))
 
 
 def _base_model_key(model: str) -> str:
@@ -168,13 +195,65 @@ def _load_tdm_pricing() -> None:
         print(f"[pricing] TDM model_pricing not available ({type(e).__name__}); using fallback table")
 
 
-def resolve_price_per_1k(model: str, args) -> tuple[float, float]:
-    """Return (input, output) USD-per-1K-token prices for budget estimation."""
-    if args.price_in is not None and args.price_out is not None:
-        return args.price_in, args.price_out
+def _fallback_price_per_1k(model: str):
     for key in (model, _base_model_key(model)):
         if FALLBACK_PRICE_PER_1K.get(key):
             return FALLBACK_PRICE_PER_1K[key]
+    return None
+
+
+def _tdm_price_per_1k(model: str):
+    """Interpret the TDM ``model_pricing`` table -> (in, out) USD per 1K tokens.
+
+    The table's units are unknown to us; ``METRIC`` is the token unit prices are
+    quoted per (observed METRIC=1000 => prices are per 1K tokens). We sanity-check
+    the result against the built-in fallback and ignore it if the magnitude looks
+    wrong (a unit mismatch must never silently inflate the budget).
+    """
+    if not _TDM_PRICING:
+        return None
+    metric = float(_TDM_METRIC or 1000)
+    for key in (model, _base_model_key(model), model.replace("-", "_"),
+                _base_model_key(model).replace("-", "_")):
+        entry = _TDM_PRICING.get(key)
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            pin = entry.get("input", entry.get("prompt", entry.get("in")))
+            pout = entry.get("output", entry.get("completion", entry.get("out", pin)))
+        elif isinstance(entry, (list, tuple)) and entry:
+            pin, pout = entry[0], entry[-1]
+        else:
+            pin = pout = entry
+        try:
+            scale = 1000.0 / metric
+            per_in, per_out = float(pin) * scale, float(pout) * scale
+        except (TypeError, ValueError):
+            continue
+        if per_in < 0 or per_out < 0 or (per_in + per_out) == 0:
+            continue
+        fb = _fallback_price_per_1k(model)
+        if fb:  # distrust a wildly different magnitude (likely a unit mismatch)
+            ratio = (per_in + per_out) / (fb[0] + fb[1] or 1e-9)
+            if ratio > 50 or ratio < 0.02:
+                print(f"[pricing] WARN: TDM price for {model} looks off "
+                      f"(~{ratio:.1f}x fallback); using fallback. Override with --price-in/out.")
+                return fb
+        return (per_in, per_out)
+    return None
+
+
+def resolve_price_per_1k(model: str, args) -> tuple[float, float]:
+    """(input, output) USD per 1K tokens. Precedence: CLI override > TDM
+    model_pricing table > built-in fallback > generic default."""
+    if args.price_in is not None and args.price_out is not None:
+        return args.price_in, args.price_out
+    tdm = _tdm_price_per_1k(model)
+    if tdm is not None:
+        return tdm
+    fb = _fallback_price_per_1k(model)
+    if fb is not None:
+        return fb
     # Unknown model: assume a mid/cheap price so projections aren't wildly off.
     return (0.0005, 0.0015)
 
@@ -258,6 +337,65 @@ def flatten_usage(usage) -> tuple[int, int, float]:
 
 
 # ============================================================================
+# Persistent daily usage ledger
+# ============================================================================
+# Re-read on every run so the $/day cap holds across restarts/crashes within the
+# same calendar day. Phase A spend lives in this ledger; Phase B spend is read
+# straight from the per-row predictions JSONL (each row carries its cost + ts).
+DEFAULT_LEDGER = ARTIFACTS_DIR / "usage_ledger.jsonl"
+
+
+def _today() -> str:
+    return dt.date.today().isoformat()
+
+
+def record_run_usage(ledger_path: Path, phase: str, model: str, rows, ptok, ctok, cost):
+    """Append one timestamped accounting line for a phase of this run."""
+    try:
+        Path(ledger_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": dt.datetime.now().isoformat(timespec="seconds"),
+                "day": _today(), "phase": phase, "model": model, "rows": rows,
+                "prompt_tokens": int(ptok), "completion_tokens": int(ctok),
+                "cost": round(float(cost), 6),
+            }) + "\n")
+    except Exception as e:
+        print(f"[ledger] WARN: could not write {ledger_path}: {e}")
+
+
+def _sum_today_cost(path: Path, where=None, day=None) -> float:
+    """Sum the 'cost' field of today's records in a JSONL file."""
+    day = day or _today()
+    total = 0.0
+    if not Path(path).exists():
+        return 0.0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rec_day = rec.get("day") or str(rec.get("ts", ""))[:10]
+            if rec_day != day or (where and not where(rec)):
+                continue
+            c = rec.get("cost")
+            if isinstance(c, (int, float)):
+                total += float(c)
+    return total
+
+
+def today_spend(args) -> tuple[float, float, float]:
+    """(phaseA, phaseB, total) USD already spent TODAY across all runs."""
+    a = _sum_today_cost(args.ledger, where=lambda r: str(r.get("phase", "")).startswith("A"))
+    b = _sum_today_cost(args.out)  # predictions JSONL: per-row cost, day from ts
+    return a, b, a + b
+
+
+# ============================================================================
 # The classifier signature (one call -> decision + all requested columns)
 # ============================================================================
 class OntarioFloodClassifier(dspy.Signature):
@@ -329,6 +467,37 @@ OUTPUT_FIELDS = [
 
 
 # ============================================================================
+# Adapter: force a single json_object call per row
+# ============================================================================
+class JsonObjectAdapter(dspy.JSONAdapter):
+    """Always do ONE call with ``response_format={"type":"json_object"}``.
+
+    DSPy's default path tries OpenAI *structured outputs* (a json_schema
+    response_format) first; the TDM proxy rejects that, so DSPy logs
+    "Failed to use structured output format, falling back to JSON mode." and
+    RETRIES — doubling latency on every one of the 90k rows. Plain json_object
+    mode is exactly what the previous TDM script used and the proxy supports it,
+    so we skip the schema attempt (and the ChatAdapter->JSONAdapter fallback)
+    entirely by calling the base adapter directly with json_object forced on.
+    """
+
+    def __call__(self, lm, lm_kwargs, signature, demos, inputs):
+        lm_kwargs = dict(lm_kwargs)
+        lm_kwargs["response_format"] = {"type": "json_object"}
+        return Adapter.__call__(self, lm, lm_kwargs, signature, demos, inputs)
+
+    async def acall(self, lm, lm_kwargs, signature, demos, inputs):
+        lm_kwargs = dict(lm_kwargs)
+        lm_kwargs["response_format"] = {"type": "json_object"}
+        return await Adapter.acall(self, lm, lm_kwargs, signature, demos, inputs)
+
+
+def configure_dspy():
+    """Global DSPy config: usage tracking + the single-call json_object adapter."""
+    dspy.configure(track_usage=True, adapter=JsonObjectAdapter())
+
+
+# ============================================================================
 # LM construction (injectable so --self-test can swap in a DummyLM)
 # ============================================================================
 _LM_FACTORY = None  # set by self-test to bypass the real proxy
@@ -362,9 +531,15 @@ def build_lm(model: str, args, api_key: str | None = None) -> dspy.LM:
     )
     if is_reasoning_model(model):
         # o-series / gpt-5 reject temperature!=1 and need headroom for hidden
-        # reasoning tokens on top of our structured output.
+        # reasoning tokens; DSPy converts max_tokens -> max_completion_tokens.
+        # reasoning_effort='minimal' keeps gpt-5 fast+cheap enough for 90k rows.
         kwargs["temperature"] = 1.0
         kwargs["max_tokens"] = max(args.max_tokens, 16000)
+        effort = args.reasoning_effort
+        if effort == "minimal" and not model.lower().startswith("gpt-5"):
+            effort = "low"  # o-series supports low/medium/high, not 'minimal'
+        if effort and effort != "none":
+            kwargs["reasoning_effort"] = effort
     else:
         kwargs["temperature"] = args.temperature
         kwargs["max_tokens"] = args.max_tokens
@@ -513,9 +688,9 @@ def evaluate_program(program, examples, model, args) -> dict:
         return i, ok, time.perf_counter() - t0
 
     with ThreadPoolExecutor(max_workers=args.eval_workers) as pool:
-        for i, ok, dt in pool.map(work, list(enumerate(examples))):
+        for i, ok, lat in pool.map(work, list(enumerate(examples))):
             preds[i] = ok
-            latencies.append(dt)
+            latencies.append(lat)
 
     tp = fp = fn = tn = 0
     score_sum = 0.0
@@ -568,7 +743,7 @@ def compile_fewshot(base_program, trainset, args):
     return optimizer.compile(base_program, trainset=trainset)
 
 
-def phase_optimize(args, api_key):
+def phase_optimize(args, api_key, remaining_budget):
     rows = load_annotations(args.annotations)
     n_pos = sum(r["is_ontario_flood"] for r in rows)
     print(
@@ -584,12 +759,25 @@ def phase_optimize(args, api_key):
         f"(eval positives={ep})  strategies={args.strategies}"
     )
 
+    # Hard requirement: the chosen model must label the WHOLE corpus within the
+    # remaining daily budget (so we can do all ~{corpus_rows} rows in one day).
+    afford_cap = remaining_budget * args.budget_safety
+    opt_cap = args.optimize_budget if args.optimize_budget else min(5.0, remaining_budget * 0.25)
+    print(
+        f"[Phase A] must fit {args.corpus_rows:,} rows in ${afford_cap:.2f} "
+        f"(=> <= ${afford_cap/args.corpus_rows*1000:.3f}/1k rows).  "
+        f"optimization spend cap ≈ ${opt_cap:.2f}."
+    )
+
     models = [canonical_model(m) for m in args.models]
-    strategies = args.strategies
     candidates = []
+    tot_ptok = tot_ctok = 0
     spent = 0.0
 
     for model in models:
+        if spent >= opt_cap:
+            print(f"[Phase A] optimization budget hit (${spent:.2f}); skipping remaining models.")
+            break
         # Build + probe the model so an unavailable one (e.g. gpt-5 not yet
         # enabled for this account) is skipped instead of killing the night.
         try:
@@ -597,130 +785,158 @@ def phase_optimize(args, api_key):
             probe = make_program("predict")
             probe.set_lm(lm)
             start = len(lm.history)
-            _ = probe(article_text="The river overflowed its banks in Galt, Ontario.")
-            _, _, c = history_usage(lm, start, model, args)
-            spent += c
+            _ = probe(article_text="The Grand River overflowed its banks at Galt, Ontario, flooding homes.")
+            pt, ct, c = history_usage(lm, start, model, args)
+            spent += c; tot_ptok += pt; tot_ctok += ct
             print(f"\n[Phase A] model '{model}' OK (probe cost ${c:.4f}).")
         except Exception as e:
-            print(f"\n[Phase A] SKIP model '{model}': {type(e).__name__}: {e}")
+            print(f"\n[Phase A] SKIP model '{model}': {type(e).__name__}: {str(e)[:160]}")
             continue
 
-        for strat in strategies:
+        for strat in args.strategies:
+            if spent >= opt_cap:
+                print(f"  [Phase A] budget hit; skipping '{strat}' for {model}.")
+                break
             tag = f"{model} :: {strat}"
             try:
                 lm = build_lm(model, args, api_key)
                 base = make_program("cot" if strat == "cot" else "predict")
                 base.set_lm(lm)
 
-                if strat in ("fewshot", "cot"):
-                    if strat == "fewshot":
-                        comp_start = len(lm.history)
-                        with dspy.context(lm=lm):
-                            program = compile_fewshot(base, train_ex, args)
-                        program.set_lm(lm)
-                        _, _, comp_cost = history_usage(lm, comp_start, model, args)
-                        spent += comp_cost
-                    else:
-                        program = base  # cot as-is (zero-shot reasoning)
-                        comp_cost = 0.0
-                else:  # zeroshot
+                comp_cost = 0.0
+                if strat == "fewshot":
+                    comp_start = len(lm.history)
+                    with dspy.context(lm=lm):
+                        program = compile_fewshot(base, train_ex, args)
+                    program.set_lm(lm)
+                    pt, ct, comp_cost = history_usage(lm, comp_start, model, args)
+                    spent += comp_cost; tot_ptok += pt; tot_ctok += ct
+                else:  # zeroshot or cot, used as-is
                     program = base
-                    comp_cost = 0.0
 
                 metrics = evaluate_program(program, eval_ex, model, args)
                 spent += metrics["eval_cost"]
-                metrics.update(
-                    {"model": model, "strategy": strat, "tag": tag,
-                     "compile_cost": comp_cost, "program": program}
-                )
+                tot_ptok += metrics["prompt_tokens"]; tot_ctok += metrics["completion_tokens"]
+                full_cost = metrics["cost_per_1k_rows"] / 1000.0 * args.corpus_rows
+                metrics.update({
+                    "model": model, "strategy": strat, "tag": tag,
+                    "compile_cost": comp_cost, "program": program,
+                    "full_corpus_cost": full_cost,
+                    "affordable": full_cost <= afford_cap,
+                })
                 candidates.append(metrics)
                 print(
-                    f"  [{tag:<28}] R={metrics['recall']:.3f} P={metrics['precision']:.3f} "
-                    f"F2={metrics['f2']:.3f} acc={metrics['accuracy']:.3f} "
-                    f"FN={metrics['fn']} ${metrics['cost_per_1k_rows']:.3f}/1k"
+                    f"  [{tag:<26}] R={metrics['recall']:.3f} P={metrics['precision']:.3f} "
+                    f"F2={metrics['f2']:.3f} FN={metrics['fn']} "
+                    f"${metrics['cost_per_1k_rows']:.3f}/1k "
+                    f"corpus=${full_cost:.2f} {'OK' if metrics['affordable'] else 'TOO$'}"
                 )
             except Exception as e:
-                print(f"  [{tag}] FAILED: {type(e).__name__}: {e}")
+                print(f"  [{tag}] FAILED: {type(e).__name__}: {str(e)[:160]}")
 
     if not candidates:
         raise SystemExit("[Phase A] no candidate produced metrics — check proxy/models.")
 
-    # Recall first: rank by F2, then raw recall, then cheaper.
-    candidates.sort(key=lambda m: (m["f2"], m["recall"], -m["cost_per_1k_rows"]), reverse=True)
-    write_report(candidates, train_ex, eval_ex, args)
+    # Rank: affordable-for-the-whole-corpus FIRST, then recall-first (F2, recall),
+    # then cheaper. This guarantees we pick a model that can do all the rows today.
+    candidates.sort(
+        key=lambda m: (m["affordable"], m["f2"], m["recall"], -m["cost_per_1k_rows"]),
+        reverse=True,
+    )
+    if any(m["affordable"] for m in candidates):
+        best = candidates[0]
+    else:
+        # Nothing fits the whole corpus in budget: pick the cheapest option with
+        # at least usable recall so we still cover as many rows as possible.
+        print("[Phase A] WARNING: no model can label the full corpus within budget; "
+              "choosing the cheapest decent-recall option. Use a cheaper model, raise "
+              "--budget, or lower --corpus-rows to fit the full corpus in one day.")
+        pool = [m for m in candidates if m["recall"] >= 0.6] or candidates
+        best = min(pool, key=lambda m: m["full_corpus_cost"])
 
-    best = candidates[0]
+    write_report(candidates, train_ex, eval_ex, args, remaining_budget)
+    record_run_usage(args.ledger, "A", best["model"], len(candidates), tot_ptok, tot_ctok, spent)
+
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     best["program"].save(str(ARTIFACTS_DIR / "best_program.json"))
     with open(ARTIFACTS_DIR / "best_program.meta.json", "w") as f:
         json.dump(
-            {"model": best["model"], "strategy": best["strategy"],
-             "f2": best["f2"], "recall": best["recall"], "precision": best["precision"]},
+            {"day": _today(), "model": best["model"], "strategy": best["strategy"],
+             "f2": best["f2"], "recall": best["recall"], "precision": best["precision"],
+             "cost_per_1k_rows": best["cost_per_1k_rows"],
+             "full_corpus_cost": best["full_corpus_cost"], "affordable": best["affordable"]},
             f, indent=2,
         )
+    args._best_cost_per_row = best["cost_per_1k_rows"] / 1000.0  # for Phase B sizing
     print(
-        f"\n[Phase A] BEST = {best['tag']}  "
-        f"(recall={best['recall']:.3f}, F2={best['f2']:.3f}).  Phase A spend ≈ ${spent:.4f}"
+        f"\n[Phase A] BEST = {best['tag']}  (recall={best['recall']:.3f}, F2={best['f2']:.3f}, "
+        f"~${best['full_corpus_cost']:.2f} for {args.corpus_rows:,} rows).  "
+        f"Phase A spend ≈ ${spent:.4f}"
     )
     return best["program"], best["model"], spent
 
 
-def write_report(candidates, train_ex, eval_ex, args):
+def write_report(candidates, train_ex, eval_ex, args, remaining_budget):
     """Print + persist evaluation metrics for the top-3 prompts (and full board)."""
     top3 = candidates[:3]
+    afford_cap = remaining_budget * args.budget_safety
     print("\n" + "=" * 78)
-    print("TOP 3 PROMPTS  (held-out eval set, recall-first ranking)")
+    print(f"TOP 3 PROMPTS  (recall-first, must fit {args.corpus_rows:,} rows in ${afford_cap:.0f})")
     print("=" * 78)
     for rank, m in enumerate(top3, 1):
+        fits = "fits budget" if m["affordable"] else "OVER BUDGET for full corpus"
         print(
             f"#{rank}  {m['tag']}\n"
             f"     recall={m['recall']:.3f}  precision={m['precision']:.3f}  "
             f"F1={m['f1']:.3f}  F2={m['f2']:.3f}  acc={m['accuracy']:.3f}\n"
             f"     confusion: TP={m['tp']} FP={m['fp']} FN={m['fn']} TN={m['tn']}  "
             f"(missed floods={m['fn']})\n"
-            f"     ~{m['avg_tokens_per_row']:.0f} tok/row  "
-            f"${m['cost_per_1k_rows']:.3f}/1k rows  {m['avg_latency_s']:.2f}s/row"
+            f"     ~{m['avg_tokens_per_row']:.0f} tok/row  ${m['cost_per_1k_rows']:.3f}/1k rows  "
+            f"{m['avg_latency_s']:.2f}s/row  |  full corpus ≈ ${m['full_corpus_cost']:.2f} ({fits})"
         )
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    serial = []
-    for m in candidates:
-        serial.append({k: v for k, v in m.items() if k != "program"})
+    serial = [{k: v for k, v in m.items() if k != "program"} for m in candidates]
     with open(ARTIFACTS_DIR / "prompt_eval_report.json", "w") as f:
         json.dump(
             {"eval_size": len(eval_ex), "train_size": len(train_ex),
-             "ranking": "recall-first (F2 desc, recall desc, cost asc)",
+             "corpus_rows": args.corpus_rows, "afford_cap": afford_cap,
+             "ranking": "affordable-for-full-corpus first, then F2 desc, recall desc, cost asc",
              "candidates": serial},
             f, indent=2,
         )
 
     lines = [
-        "# Prompt optimization report (recall-first)",
+        "# Prompt optimization report (recall-first, budget-aware)",
         "",
         f"- Train rows: {len(train_ex)}  |  Held-out eval rows: {len(eval_ex)}",
         "- Target: `is_ontario_flood = flood AND ontario`",
-        "- Ranking: **F2** (recall-weighted) → recall → lower cost.",
+        f"- Constraint: label the full **{args.corpus_rows:,}-row** corpus within "
+        f"**${afford_cap:.0f}** (one day).",
+        "- Ranking: **fits-budget first**, then **F2** (recall-weighted) → recall → cheaper.",
         "- Note: prompts are *selected* on this same held-out set, so the winner's",
         "  numbers are mildly optimistic; treat them as comparative.",
         "",
         "## Top 3 prompts",
         "",
-        "| # | model | strategy | recall | precision | F1 | F2 | acc | missed | $/1k rows | tok/row |",
-        "|---|-------|----------|-------:|----------:|---:|---:|----:|------:|----------:|--------:|",
+        "| # | model | strategy | recall | precision | F1 | F2 | missed | $/1k rows | full corpus $ | fits? |",
+        "|---|-------|----------|-------:|----------:|---:|---:|------:|----------:|-------------:|:-----:|",
     ]
     for rank, m in enumerate(top3, 1):
         lines.append(
             f"| {rank} | {m['model']} | {m['strategy']} | {m['recall']:.3f} | "
-            f"{m['precision']:.3f} | {m['f1']:.3f} | {m['f2']:.3f} | {m['accuracy']:.3f} | "
-            f"{m['fn']} | ${m['cost_per_1k_rows']:.3f} | {m['avg_tokens_per_row']:.0f} |"
+            f"{m['precision']:.3f} | {m['f1']:.3f} | {m['f2']:.3f} | {m['fn']} | "
+            f"${m['cost_per_1k_rows']:.3f} | ${m['full_corpus_cost']:.2f} | "
+            f"{'✅' if m['affordable'] else '❌'} |"
         )
     lines += ["", "## Full leaderboard", "",
-              "| model | strategy | recall | precision | F2 | missed | $/1k rows |",
-              "|-------|----------|-------:|----------:|---:|------:|----------:|"]
+              "| model | strategy | recall | precision | F2 | missed | $/1k rows | full corpus $ | fits? |",
+              "|-------|----------|-------:|----------:|---:|------:|----------:|-------------:|:-----:|"]
     for m in candidates:
         lines.append(
             f"| {m['model']} | {m['strategy']} | {m['recall']:.3f} | {m['precision']:.3f} | "
-            f"{m['f2']:.3f} | {m['fn']} | ${m['cost_per_1k_rows']:.3f} |"
+            f"{m['f2']:.3f} | {m['fn']} | ${m['cost_per_1k_rows']:.3f} | "
+            f"${m['full_corpus_cost']:.2f} | {'✅' if m['affordable'] else '❌'} |"
         )
     (ARTIFACTS_DIR / "prompt_eval_report.md").write_text("\n".join(lines) + "\n")
     print(f"\n[Phase A] wrote {ARTIFACTS_DIR/'prompt_eval_report.md'} and .json")
@@ -823,6 +1039,7 @@ def phase_run(program, model, spent_so_far, args, api_key):
         rec["completion_tokens"] = ctok
         rec["cost"] = round(cost, 6)
         rec["seconds"] = round(time.perf_counter() - t0, 3)
+        rec["ts"] = dt.datetime.now().isoformat(timespec="seconds")  # for daily spend
         return rec
 
     def commit(rec, fout):
@@ -937,18 +1154,19 @@ def report_run(stats, run_cost, wall, spent_before, model, args):
     print(f"  tokens                    : {stats['ptok']+stats['ctok']:,}")
     print(f"  wall time                 : {_hms(wall)}  ({wall/n:.2f}s/row, {args.workers} workers)")
     print(f"  this-run cost             : ${run_cost:.4f}")
-    print(f"  total spend (A+B)         : ${spent_before + run_cost:.4f} / ${args.budget:.2f} budget")
+    print(f"  today's total spend (A+B) : ${spent_before + run_cost:.4f} / ${args.budget:.2f} budget")
     per_row = run_cost / n
-    for label, total in (("this shard ~22,860", 22860), ("full corpus ~91,000", 91000)):
-        print(f"  proj: {label:<22} -> ${per_row*total:,.2f}, {_hms((wall/n)*total)}")
-    remaining = args.extrapolate_total
+    total = args.corpus_rows
+    print(f"  proj: full corpus {total:,} -> ${per_row*total:,.2f}, "
+          f"{_hms((wall/n)*total)} wall (at {args.workers} workers)")
     done_est = len(load_processed_ids(args.out))
-    if remaining:
-        left = max(0, remaining - done_est)
-        print(f"  remaining in corpus       : ~{left:,} rows "
-              f"(≈ {left*per_row/args.budget:.1f} more daily budgets at this model)")
-    print("\nRe-run tomorrow to resume the next budget's worth (checkpoint = "
-          f"{args.out}).")
+    left = max(0, total - done_est)
+    print(f"  corpus labelled so far    : {done_est:,} / {total:,}  (remaining ~{left:,})")
+    if left == 0:
+        print("\n  ✅ ENTIRE CORPUS LABELLED.")
+    else:
+        print(f"\n  Re-run to continue (checkpoint = {args.out}); "
+              f"~{left*per_row:.2f} more needed for the rest.")
 
 
 # ============================================================================
@@ -1021,7 +1239,8 @@ def run_self_test(args):
         the Phase-A model probe) instead of unparseable 'No more responses'."""
 
         def __init__(self, answers: dict, default: dict):
-            super().__init__(answers)
+            # format answers as JSON so the JsonObjectAdapter can parse them
+            super().__init__(answers, adapter=dspy.JSONAdapter())
             self._answers_map = answers
             self._default = default
 
@@ -1060,7 +1279,8 @@ def run_self_test(args):
     global _LM_FACTORY
     _LM_FACTORY = lambda model: _SelfTestLM(answers_for(seeds.get(model, 0)), default)  # noqa: E731
 
-    dspy.configure(lm=_LM_FACTORY("fakeA"), track_usage=True)
+    dspy.configure(lm=_LM_FACTORY("fakeA"))
+    configure_dspy()  # JsonObjectAdapter + track_usage (what the real run uses)
 
     args.models = ["fakeA", "fakeB"]
     args.strategies = ["zeroshot", "fewshot"]
@@ -1068,16 +1288,18 @@ def run_self_test(args):
     args.extracts = ext
     args.out = tmp / "preds.jsonl"
     args.out_csv = tmp / "preds.csv"
+    args.ledger = tmp / "ledger.jsonl"
     args.budget = 100.0
+    args.corpus_rows = 12
     args.max_rows = 12
     args.workers = 4
     args.eval_workers = 4
     args.price_in = 0.001
     args.price_out = 0.002
+    args.optimize_budget = 50.0
 
     print("=== SELF-TEST (DummyLM, no network) ===")
-    program, model, spent = phase_optimize(args, api_key="dummy")
-    args._best_cost_per_row = 0.0001
+    program, model, spent = phase_optimize(args, api_key="dummy", remaining_budget=100.0)
     phase_run(program, model, spent, args, api_key="dummy")
 
     # assertions
@@ -1089,7 +1311,12 @@ def run_self_test(args):
         assert col in rdr[0], f"missing column {col}"
     assert (ARTIFACTS_DIR / "prompt_eval_report.md").exists(), "no report"
     assert (ARTIFACTS_DIR / "best_program.json").exists(), "no best program saved"
-    print(f"\nSELF-TEST PASSED ✅  ({len(rdr)} rows labelled; columns OK; report+best saved)")
+    assert args.ledger.exists(), "no usage ledger written"
+    # daily-spend re-read works
+    _a, _b, tot = today_spend(args)
+    assert tot > 0, "today_spend did not pick up ledger + predictions"
+    print(f"\nSELF-TEST PASSED ✅  ({len(rdr)} rows labelled; columns OK; report+best+ledger saved)")
+    print(f"  today_spend re-read: A=${_a:.4f} B=${_b:.4f} total=${tot:.4f}")
     print(f"  scratch dir: {tmp}")
     _LM_FACTORY = None
 
@@ -1111,15 +1338,22 @@ def build_parser():
     p.add_argument("--base-url", default=TDM_BASE_URL)
     p.add_argument("--token-file", default=TDM_TOKEN_FILE)
     p.add_argument("--api-key", default=None, help="overrides --token-file")
-    # models / prompts
+    # models / prompts. Defaults are all cheap enough to label the whole corpus
+    # in a day, and include the newer gpt-5 family (probed; skipped if the
+    # account can't reach them). gpt-4.1 was dropped from defaults: at ~$4/1k
+    # rows it cannot do 90k within $50.
     p.add_argument("--models", type=lambda s: [x for x in s.split(",") if x],
-                   default=["gpt-4o-mini", "gpt-4.1-nano", "gpt-4.1"],
+                   default=["gpt-4o-mini", "gpt-5-nano", "gpt-5-mini", "gpt-4.1-nano"],
                    help="comma-separated candidate models (accepts gpt_4o_mini or gpt-4o-mini)")
     p.add_argument("--strategies", type=lambda s: [x for x in s.split(",") if x],
                    default=["zeroshot", "fewshot"],
                    help="prompt strategies: zeroshot,fewshot,cot")
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--max-tokens", type=int, default=1024)
+    p.add_argument("--max-tokens", type=int, default=1024,
+                   help="output cap (reasoning models are auto-raised to >=16000)")
+    p.add_argument("--reasoning-effort", default="minimal",
+                   choices=["minimal", "low", "medium", "high", "none"],
+                   help="effort for gpt-5/o-series; 'minimal' keeps them fast+cheap")
     p.add_argument("--num-retries", type=int, default=4)
     p.add_argument("--no-cache", action="store_true")
     # pricing (for budget estimation only; proxy's measured cost wins when present)
@@ -1132,17 +1366,24 @@ def build_parser():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-demos", type=int, default=4, help="bootstrapped few-shot demos")
     p.add_argument("--max-rounds", type=int, default=1)
+    p.add_argument("--optimize-budget", type=float, default=None,
+                   help="USD cap on Phase A (default min($5, 25%% of remaining))")
     # budget / scale
-    p.add_argument("--budget", type=float, default=50.0, help="daily USD cap (A+B)")
+    p.add_argument("--budget", type=float, default=50.0, help="daily USD cap (A+B), tracked across runs")
     p.add_argument("--budget-safety", type=float, default=0.90, help="fraction of remaining budget to commit")
-    p.add_argument("--max-rows", type=int, default=None, help="hard cap on rows labelled this run")
+    p.add_argument("--corpus-rows", type=int, default=91000,
+                   help="total unlabelled rows; the chosen model must fit ALL of them in one day")
+    p.add_argument("--max-rows", type=int, default=None, help="optional hard cap on rows labelled this run")
     p.add_argument("--workers", type=int, default=8, help="concurrent inference requests (Phase B)")
     p.add_argument("--eval-workers", type=int, default=8, help="concurrent eval requests (Phase A)")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--extrapolate-total", type=int, default=91000)
+    p.add_argument("--log-every", type=int, default=500)
+    p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER,
+                   help="persistent daily usage log, re-read each run for the $/day cap")
     # flow control
     p.add_argument("--skip-optimize", action="store_true", help="skip Phase A; reuse saved best")
     p.add_argument("--reuse-best", action="store_true", help="load artifacts/best_program.json")
+    p.add_argument("--force-optimize", action="store_true",
+                   help="re-run Phase A even if today's prompt is already cached")
     p.add_argument("--optimize-only", action="store_true", help="run Phase A only")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--self-test", action="store_true", help="offline mechanical test (DummyLM)")
@@ -1156,15 +1397,28 @@ def load_best_from_disk(args):
     if not prog_path.exists():
         raise SystemExit(f"--reuse-best/--skip-optimize but {prog_path} not found. Run Phase A first.")
     model = canonical_model(args.models[0])
-    strategy = "fewshot"
+    strategy, meta = "fewshot", {}
     if meta_path.exists():
         meta = json.load(open(meta_path))
         model = canonical_model(meta.get("model", model))
         strategy = meta.get("strategy", strategy)
     program = make_program("cot" if strategy == "cot" else "predict")
     program.load(str(prog_path))
-    print(f"[reuse] loaded best program (model='{model}', strategy='{strategy}') from {prog_path}")
+    args._best_cost_per_row = (meta.get("cost_per_1k_rows", 0.0) or 0.0) / 1000.0
+    print(f"[reuse] loaded best program (model='{model}', strategy='{strategy}', "
+          f"day={meta.get('day','?')}) from {prog_path}")
     return program, model
+
+
+def _cached_prompt_is_today() -> bool:
+    meta_path = ARTIFACTS_DIR / "best_program.meta.json"
+    prog_path = ARTIFACTS_DIR / "best_program.json"
+    if not (meta_path.exists() and prog_path.exists()):
+        return False
+    try:
+        return json.load(open(meta_path)).get("day") == _today()
+    except Exception:
+        return False
 
 
 def main():
@@ -1175,38 +1429,49 @@ def main():
         return
 
     _load_tdm_pricing()
-    dspy.configure(track_usage=True)
+    configure_dspy()  # track usage + single-call json_object adapter
     api_key = read_api_key(args)
+
+    # Re-read the log: how much of today's budget is already gone (prior runs)?
+    spent_A, spent_B, already = today_spend(args)
+    remaining = max(0.0, args.budget - already)
 
     print("=" * 78)
     print("TDM OVERNIGHT FLOOD LABELLER")
     print("=" * 78)
-    print(f"  budget        : ${args.budget:.2f}/day")
+    print(f"  budget        : ${args.budget:.2f}/day   (today already spent ${already:.4f}: "
+          f"A=${spent_A:.4f} B=${spent_B:.4f})")
+    print(f"  remaining     : ${remaining:.4f}")
     print(f"  candidates    : {[canonical_model(m) for m in args.models]}")
-    print(f"  strategies    : {args.strategies}")
+    print(f"  strategies    : {args.strategies}   reasoning_effort={args.reasoning_effort}")
+    print(f"  corpus        : {args.corpus_rows:,} rows  (goal: all in one day)")
     print(f"  annotations   : {args.annotations}")
     print(f"  extracts      : {args.extracts}")
     print(f"  proxy         : {args.base_url}")
+    print(f"  ledger        : {args.ledger}")
 
-    spent = 0.0
+    if remaining <= 0.01:
+        print("\n[stop] today's budget is exhausted. Re-run tomorrow (the ledger resets by day).")
+        return
+
+    spent_thisrun = 0.0
     if args.skip_optimize or args.reuse_best:
         program, model = load_best_from_disk(args)
         program.set_lm(build_lm(model, args, api_key))
+    elif (not args.force_optimize) and _cached_prompt_is_today():
+        print("\n[Phase A] reusing today's already-optimized prompt "
+              "(use --force-optimize to re-run). Its cost is already in the ledger.")
+        program, model = load_best_from_disk(args)
+        program.set_lm(build_lm(model, args, api_key))
     else:
-        program, model, spent = phase_optimize(args, api_key)
-        # remember the winner's measured per-row cost for Phase B sizing
-        try:
-            rep = json.load(open(ARTIFACTS_DIR / "prompt_eval_report.json"))
-            best = rep["candidates"][0]
-            args._best_cost_per_row = best.get("cost_per_1k_rows", 0.0) / 1000.0
-        except Exception:
-            args._best_cost_per_row = 0.0
+        program, model, spent_thisrun = phase_optimize(args, api_key, remaining)
 
     if args.optimize_only:
         print("\n[done] --optimize-only set; skipping Phase B.")
         return
 
-    phase_run(program, model, spent, args, api_key)
+    # spent_so_far for Phase B = everything already spent today + this run's Phase A
+    phase_run(program, model, already + spent_thisrun, args, api_key)
 
 
 if __name__ == "__main__":
