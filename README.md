@@ -132,6 +132,62 @@ Notes:
   pipeline cascade where `isOntario` only sees articles that passed the flood
   filter.
 
+## Overnight run on ProQuest TDM (`src/tdm_overnight.py`)
+
+`src/tdm_overnight.py` is a **single self-contained script** built to run
+unattended overnight inside ProQuest TDM Studio against the OpenAI-compatible
+proxy. It does the whole job — optimize, evaluate, then label — in one pass,
+favouring **recall over precision** (we would rather over-include than lose a
+real Ontario flood).
+
+**Phase A — optimize & pick a prompt.** Reads `annotations_so_far.csv`, derives
+the target `is_ontario_flood = flood AND ontario`, and uses DSPy
+(`BootstrapFewShot`) to compile few-shot prompts. Several candidate models are
+tried (default `gpt-4o-mini`, `gpt-4.1-nano`, `gpt-4.1`) and each prompt is
+scored on a held-out split with a recall-first metric (a missed flood costs the
+most; over-inclusion is tolerated). It prints and saves **evaluation metrics for
+the top 3 prompts** (recall, precision, F1, **F2**, accuracy, confusion matrix,
+$/1k rows) to `artifacts/prompt_eval_report.{md,json}` and saves the winner to
+`artifacts/best_program.json`.
+
+**Phase B — label the corpus.** Runs the winning prompt over a subset of the
+~91k unlabelled extracts (schema of `extracted_only_1.csv`), sized to fit a
+daily dollar **budget** (default `$50`). For every row it emits exactly the
+requested columns:
+
+| Column | Meaning |
+|--------|---------|
+| `is_ontario_flood` | the decision (recall-first) |
+| `decision` | `ontario_flood` / `flood_not_ontario` / `not_flood` |
+| `reason` | a **specific** justification citing clues from that text |
+| `flood_location` | where the flood was (filled when it's *not* Ontario) |
+| `not_flood_reason` | why it isn't a flood (`metaphor`, `not_specific_event`, `artificial`, …) |
+| `flood_type` | `river` / `lake` / `flash` / `ice_jam` / `dam_break` / … |
+
+Output is checkpointed to JSONL (`--no-resume` to disable) and written to
+`data/processed/ontario_flood_predictions.csv`, so an interrupted night resumes
+cleanly and a `$50/day` cap can simply be re-run the next day to continue.
+
+```bash
+pip install dspy-ai tiktoken          # openai/litellm come with dspy
+
+cd src
+python tdm_overnight.py --self-test                 # offline mechanical check (no proxy/spend)
+python tdm_overnight.py                              # real run: optimize + label within $50
+python tdm_overnight.py --optimize-only             # just Phase A + the top-3 report
+python tdm_overnight.py --reuse-best --skip-optimize  # relabel using last night's prompt
+python tdm_overnight.py --models gpt-4o-mini,gpt-4.1-nano,o4-mini,gpt-5  # add reasoning/GPT-5
+python tdm_overnight.py --help                      # all options (budget, workers, models, …)
+```
+
+The script reads the proxy token from `/home/ec2-user/SageMaker/.token/.agaitoken`
+and talks to the proxy via DSPy/LiteLLM (`openai/<model>`). Reasoning models
+(`o3`, `o4-mini`) and `gpt-5` are handled (no `temperature=0`, extra token
+headroom) and any model the account can't reach is probed and skipped rather
+than crashing the run. Cost uses the proxy's measured per-call cost when
+available, otherwise a built-in price table (override exactly with
+`--price-in`/`--price-out`, or supply TDM's `scripts/model_pricing.py`).
+
 ## Project layout
 
 ```
@@ -140,9 +196,11 @@ src/
   ocr.py          # Stage 1 signature: OCR correction
   signatures.py   # Stage 2 + 3 signatures: flood/Ontario filters and extraction
   optimize.py     # Compile better filter prompts from labelled data
+  run_inference.py    # Batch the local (Ollama) pipeline over extracts
+  tdm_overnight.py    # One-shot TDM job: optimize -> top-3 report -> budgeted labelling
 data/
   raw/            # Input OCR text + annotations_so_far.csv (git-ignored)
   processed/      # Pipeline output (git-ignored)
-artifacts/        # Compiled DSPy programs from optimize.py (git-ignored)
+artifacts/        # Compiled DSPy programs + prompt_eval_report.* (git-ignored)
 requirements.txt
 ```
