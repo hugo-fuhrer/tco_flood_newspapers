@@ -192,6 +192,59 @@ python tdm_overnight.py --models gpt-4o-mini,gpt-5-mini,o4-mini  # custom model 
 python tdm_overnight.py --help                      # all options (budget, corpus-rows, workers, …)
 ```
 
+### Three follow-up modes (after the first overnight run)
+
+Once a prompt has been picked and some of the corpus is labelled, three extra
+modes let you finish the job, try alternatives, and report on what happened.
+None of them re-run Phase A by surprise.
+
+**(1) Continue labelling the leftover corpus — `--continue-run`.** Skips Phase A,
+loads the saved best prompt, and keeps labelling the still-unlabelled rows,
+resuming from the JSONL checkpoint (rows already done are skipped). By default it
+still respects the daily `--budget`; add **`--ignore-budget`** to bypass the cap
+and push through the *entire* remainder in one sitting:
+
+```bash
+python tdm_overnight.py --continue-run                 # do as much as today's budget allows
+python tdm_overnight.py --continue-run --ignore-budget # finish ALL remaining rows now
+python tdm_overnight.py --continue-run --max-rows 20000 # bounded chunk
+```
+
+**(2) Test more models / configs on the 250 hand-labelled rows — `--test-models`.**
+Benchmarks a sweep of `--models` × `--strategies` (× optional
+`--reasoning-efforts` / `--temperatures`) on the labelled set and writes a ranked
+comparison to `artifacts/model_test_report.{md,json}` (recall, precision,
+accuracy, F1, F2, FN/FP, $/1k rows, projected full-corpus cost, fits-budget?).
+Each config's per-row predictions are saved to `artifacts/labeled_eval__*.jsonl`
+for reuse by the report. No corpus run, so it only spends on the 250 rows.
+
+```bash
+python tdm_overnight.py --test-models \
+    --models gpt-4o-mini,gpt-4.1-mini,gpt-5-nano,o4-mini \
+    --strategies zeroshot,fewshot --reasoning-efforts minimal,low
+python tdm_overnight.py --test-models --eval-on-full   # score all 250, not a held-out split
+```
+
+**(3) Full markdown report — `--report`.** Scores a chosen model on the 250
+hand-labelled rows and writes `artifacts/full_report.{md,json}` containing:
+**recall / precision / accuracy / F1 / F2**, the **binary + 3-way confusion
+matrices**, the **gold-vs-predicted label distribution**, and a worked
+**analysis of the false negatives (missed Ontario floods) and false positives**
+with each row's extract and the model's own reason. It then folds in the corpus
+predictions already on disk (the ~14k done) to report the decision/flood-type
+distribution and **measured spend**, and projects **cost + wall-time for the
+remaining rows and the full `--corpus-rows`** from those measured per-row numbers.
+
+```bash
+python tdm_overnight.py --report                       # uses the compiled best prompt
+python tdm_overnight.py --report --report-model gpt-4.1-mini --report-strategy zeroshot
+python tdm_overnight.py --report --reuse-eval artifacts/labeled_eval__gpt-4o-mini__best.jsonl
+```
+
+`--reuse-eval` regenerates the report from saved per-row predictions with **no LM
+calls** (works fully offline), so you can iterate on the report or point it at any
+config produced by `--test-models`.
+
 Operational details:
 - **Network-restricted (TDM).** Sets `LITELLM_LOCAL_MODEL_COST_MAP` before
   importing LiteLLM so it never tries to fetch its remote cost map (the

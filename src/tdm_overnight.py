@@ -45,10 +45,27 @@ Examples
 
     # Try the reasoning / gpt-5 models too:
     python tdm_overnight.py --models gpt-4o-mini,gpt-4.1-nano,o4-mini,gpt-5
+
+    # (1) CONTINUE labelling the leftover unlabelled rows with the saved prompt,
+    #     pushing through the whole remainder regardless of the daily cap:
+    python tdm_overnight.py --continue-run --ignore-budget
+
+    # (2) TEST more models/configs on the 250 hand-labelled rows (no corpus run);
+    #     writes artifacts/model_test_report.{md,json} + per-row predictions:
+    python tdm_overnight.py --test-models \
+        --models gpt-4o-mini,gpt-4.1-mini,gpt-5-nano --strategies zeroshot,fewshot \
+        --reasoning-efforts minimal,low
+
+    # (3) GENERATE a full markdown report (metrics, confusion matrices,
+    #     distributions, FP/FN analysis on the 250, and cost/time projections
+    #     for the remaining corpus that fold in the rows already labelled):
+    python tdm_overnight.py --report --report-model gpt-4o-mini
+    python tdm_overnight.py --report --reuse-eval artifacts/labeled_eval__gpt-4o-mini__best.jsonl
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import datetime as dt
 import json
@@ -58,6 +75,7 @@ import re
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -984,16 +1002,32 @@ def phase_run(program, model, spent_so_far, args, api_key):
     if per_row <= 0:
         per_row = cost_from_tokens(model, 900, 180, args)  # rough default
     affordable = int((remaining * args.budget_safety) / per_row) if per_row > 0 else 10**9
-    n_target = affordable
-    if args.max_rows is not None:
-        n_target = min(n_target, args.max_rows)
+    corpus_left = max(0, args.corpus_rows - len(processed))
 
-    print(
-        f"\n[Phase B] model={model}  budget=${args.budget:.2f}  spent=${spent_so_far:.4f}  "
-        f"remaining=${remaining:.4f}\n"
-        f"[Phase B] est ${per_row*1000:.3f}/1k rows -> can afford ~{affordable:,} rows; "
-        f"target this run = {n_target:,} (cap --max-rows={args.max_rows})."
-    )
+    if args.ignore_budget:
+        # --continue-run --ignore-budget: push through the whole remainder in one
+        # go (the daily cap is intentionally bypassed). Size to the corpus, not $:
+        # sweep every unprocessed CSV row (the resume-skip handles what's done).
+        n_target = args.max_rows if args.max_rows is not None else 10**9
+        est_rows = corpus_left if corpus_left > 0 else 0
+        if args.max_rows is not None:
+            est_rows = min(est_rows, args.max_rows) if est_rows else args.max_rows
+        target_str = f"{n_target:,}" if args.max_rows is not None else "all remaining rows"
+        print(
+            f"\n[Phase B] model={model}  --ignore-budget (daily ${args.budget:.2f} cap bypassed)\n"
+            f"[Phase B] est ${per_row*1000:.3f}/1k rows; corpus left ≈ {corpus_left:,}; "
+            f"target this run = {target_str}; est cost ≈ ${per_row*est_rows:,.2f}."
+        )
+    else:
+        n_target = affordable
+        if args.max_rows is not None:
+            n_target = min(n_target, args.max_rows)
+        print(
+            f"\n[Phase B] model={model}  budget=${args.budget:.2f}  spent=${spent_so_far:.4f}  "
+            f"remaining=${remaining:.4f}\n"
+            f"[Phase B] est ${per_row*1000:.3f}/1k rows -> can afford ~{affordable:,} rows; "
+            f"target this run = {n_target:,} (cap --max-rows={args.max_rows})."
+        )
     if n_target <= 0:
         print("[Phase B] no budget left for inference; stopping.")
         return
@@ -1061,8 +1095,9 @@ def phase_run(program, model, spent_so_far, args, api_key):
             stats["flood_not_on"] += 1
         else:
             stats["not_flood"] += 1
-        # hard budget guard
-        if spent_so_far + run_cost >= args.budget * 0.99:
+        # hard budget guard (bypassed by --ignore-budget so a continue-run can
+        # finish the whole remaining corpus across the daily cap)
+        if (not args.ignore_budget) and spent_so_far + run_cost >= args.budget * 0.99:
             stop.set()
 
     # ---- stream rows, dispatch in bounded batches, checkpoint as we go ----
@@ -1167,6 +1202,699 @@ def report_run(stats, run_cost, wall, spent_before, model, args):
     else:
         print(f"\n  Re-run to continue (checkpoint = {args.out}); "
               f"~{left*per_row:.2f} more needed for the rest.")
+
+
+# ============================================================================
+# Detailed evaluation on the labelled set  (--test-models and --report)
+# ============================================================================
+# Phase A's evaluate_program() only keeps the boolean decision (enough to rank
+# prompts). The benchmark + report modes need the model's full output per row
+# (decision, reason, location, type) so they can show distributions and analyse
+# the actual false positives / false negatives. run_on_labeled() does that.
+
+GOLD_DECISION = {  # 3-way gold label derived from (flood, ontario)
+    (True, True): "ontario_flood",
+    (True, False): "flood_not_ontario",
+    (False, True): "not_flood",   # ontario w/o flood is still not a flood
+    (False, False): "not_flood",
+}
+
+
+def _clone_args(args, **overrides):
+    """Shallow Namespace copy with field overrides (for per-config LM builds)."""
+    a = copy.copy(args)
+    for k, v in overrides.items():
+        setattr(a, k, v)
+    return a
+
+
+def _snippet(text: str, n: int = 320) -> str:
+    """Collapse whitespace and truncate to n chars for compact report tables."""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def _md_escape(text: str) -> str:
+    """Make a snippet safe to drop inside a markdown table cell."""
+    return str(text or "").replace("|", "\\|").replace("\n", " ")
+
+
+def run_on_labeled(program, rows, model, args, max_workers=None):
+    """Run the full classifier over labelled rows; return (metrics, per_row).
+
+    Each per_row record carries the gold labels, the model's full prediction,
+    its cost/latency, and a tp/fp/fn/tn ``category`` against the recall target
+    ``is_ontario_flood``. Threaded like Phase A's evaluation.
+    """
+    lm = program.get_lm()
+    workers = max_workers or args.eval_workers
+    results: dict[int, dict] = {}
+
+    def work(i_row):
+        i, r = i_row
+        t0 = time.perf_counter()
+        rec = {
+            "id": str(r.get("id", "")),
+            "date": r.get("date", ""),
+            "text": r["text"],
+            "gold_flood": bool(r["flood"]),
+            "gold_ontario": bool(r["ontario"]),
+            "gold_is_ontario_flood": bool(r["is_ontario_flood"]),
+            "gold_decision": GOLD_DECISION[(bool(r["flood"]), bool(r["ontario"]))],
+            "model": model,
+        }
+        try:
+            pred = program(article_text=r["text"])
+            for fld in OUTPUT_FIELDS:
+                rec[fld] = getattr(pred, fld, None)
+            rec["is_ontario_flood"] = bool(getattr(pred, "is_ontario_flood", False))
+            ptok, ctok, cost = flatten_usage(pred.get_lm_usage())
+            if ptok == 0 and ctok == 0:  # proxy didn't report -> estimate
+                ptok = approx_tokens(r["text"]) + 350
+                ctok = approx_tokens(" ".join(str(rec.get(f, "")) for f in OUTPUT_FIELDS))
+            if cost <= 0:
+                cost = cost_from_tokens(model, ptok, ctok, args)
+            rec["status"] = "ok"
+        except Exception as e:
+            for fld in OUTPUT_FIELDS:
+                rec[fld] = None
+            rec["is_ontario_flood"] = False  # parse/timeout -> negative for matrix
+            rec["decision"] = "error"
+            rec["reason"] = f"{type(e).__name__}: {str(e)[:200]}"
+            ptok = ctok = 0
+            cost = 0.0
+            rec["status"] = "error"
+            if args.verbose:
+                print(f"    [eval] row {i} error: {type(e).__name__}: {e}")
+        rec["prompt_tokens"] = ptok
+        rec["completion_tokens"] = ctok
+        rec["cost"] = round(cost, 6)
+        rec["seconds"] = round(time.perf_counter() - t0, 3)
+        y, p = rec["gold_is_ontario_flood"], rec["is_ontario_flood"]
+        rec["category"] = ("tp" if p and y else "fp" if p and not y else
+                           "fn" if (not p) and y else "tn")
+        return i, rec
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, rec in pool.map(work, list(enumerate(rows))):
+            results[i] = rec
+    per_row = [results[i] for i in range(len(rows))]
+    return summarize_labeled(per_row, model, args), per_row
+
+
+def summarize_labeled(per_row, model, args) -> dict:
+    """Confusion matrix + recall-first metrics + cost over labelled per-row recs."""
+    cats = Counter(r["category"] for r in per_row)
+    tp, fp, fn, tn = cats["tp"], cats["fp"], cats["fn"], cats["tn"]
+    precision, recall, f1, f2, acc = prf(tp, fp, fn, tn)
+    n = len(per_row)
+    ptok = sum(int(r.get("prompt_tokens") or 0) for r in per_row)
+    ctok = sum(int(r.get("completion_tokens") or 0) for r in per_row)
+    cost = sum(float(r.get("cost") or 0.0) for r in per_row)
+    secs = sum(float(r.get("seconds") or 0.0) for r in per_row)
+    errors = sum(1 for r in per_row if r.get("status") == "error")
+    full_cost = (cost / n * args.corpus_rows) if n else 0.0
+    return {
+        "model": model, "n": n,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "precision": precision, "recall": recall, "f1": f1, "f2": f2, "accuracy": acc,
+        "errors": errors,
+        "prompt_tokens": ptok, "completion_tokens": ctok, "cost": cost,
+        "cost_per_1k_rows": (cost / n * 1000.0) if n else 0.0,
+        "avg_tokens_per_row": ((ptok + ctok) / n) if n else 0.0,
+        "avg_latency_s": (secs / n) if n else 0.0,
+        "full_corpus_cost": full_cost,
+        "gold_dist": dict(Counter(r["gold_decision"] for r in per_row).most_common()),
+        "pred_dist": dict(Counter((r.get("decision") or "?") for r in per_row).most_common()),
+    }
+
+
+def write_labeled_eval_jsonl(path: Path, per_row):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in per_row:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def load_labeled_eval_jsonl(path: Path):
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def labeled_eval_path(model: str, strategy: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{model}__{strategy}")
+    return ARTIFACTS_DIR / f"labeled_eval__{safe}.jsonl"
+
+
+def get_labeled_program(args, api_key):
+    """Build the program used to predict on the 250 for the report.
+
+    --report-strategy 'best' loads the compiled prompt that actually labels the
+    corpus (artifacts/best_program.json); 'zeroshot'/'cot' build a fresh program
+    on --report-model. Returns (program, model, strategy_label).
+    """
+    strat = args.report_strategy
+    model = canonical_model(args.report_model) if args.report_model else None
+    if strat == "best":
+        meta_path = ARTIFACTS_DIR / "best_program.meta.json"
+        prog_path = ARTIFACTS_DIR / "best_program.json"
+        if prog_path.exists():
+            meta = json.load(open(meta_path)) if meta_path.exists() else {}
+            best_model = canonical_model(meta.get("model", model or args.models[0]))
+            model = model or best_model
+            strategy = meta.get("strategy", "fewshot")
+            program = make_program("cot" if strategy == "cot" else "predict")
+            program.load(str(prog_path))
+            program.set_lm(build_lm(model, args, api_key))
+            return program, model, f"best/{strategy} (compiled prompt in use)"
+        print("[report] no saved best_program.json; falling back to a fresh zeroshot program.")
+        strat = "zeroshot"
+    model = model or canonical_model(args.models[0])
+    program = make_program("cot" if strat == "cot" else "predict")
+    program.set_lm(build_lm(model, args, api_key))
+    return program, model, strat
+
+
+# ============================================================================
+# Reading what Phase B has already labelled (the ~14k done) + projections
+# ============================================================================
+def phaseB_progress(path: Path) -> dict:
+    """Aggregate the per-row predictions JSONL: counts, distributions, measured
+    cost + wall-time, so the report can fold in the rows already done."""
+    agg = {
+        "n": 0, "cost": 0.0, "seconds": 0.0, "ptok": 0, "ctok": 0, "errors": 0,
+        "ontario": 0, "flood_not_on": 0, "not_flood": 0,
+        "decisions": {}, "flood_types": {}, "locations": {}, "models": {}, "by_day": {},
+    }
+    if not Path(path).exists():
+        return agg
+    decisions, ftypes, locs, models, days = (Counter() for _ in range(5))
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            agg["n"] += 1
+            agg["cost"] += float(rec.get("cost") or 0.0)
+            agg["seconds"] += float(rec.get("seconds") or 0.0)
+            agg["ptok"] += int(rec.get("prompt_tokens") or 0)
+            agg["ctok"] += int(rec.get("completion_tokens") or 0)
+            d, st = rec.get("decision"), rec.get("status")
+            decisions[d or "?"] += 1
+            if m := rec.get("model"):
+                models[m] += 1
+            if ts := (rec.get("ts") or ""):
+                days[ts[:10]] += 1
+            ft = rec.get("flood_type")
+            if ft and ft not in ("n/a", "", None):
+                ftypes[ft] += 1
+            if st == "error" or d == "error":
+                agg["errors"] += 1
+                continue
+            if rec.get("is_ontario_flood") is True or d == "ontario_flood":
+                agg["ontario"] += 1
+            elif d == "flood_not_ontario":
+                agg["flood_not_on"] += 1
+                if loc := rec.get("flood_location"):
+                    locs[_snippet(loc, 40)] += 1
+            else:
+                agg["not_flood"] += 1
+    agg["decisions"] = dict(decisions.most_common())
+    agg["flood_types"] = dict(ftypes.most_common())
+    agg["locations"] = dict(locs.most_common(15))
+    agg["models"] = dict(models.most_common())
+    agg["by_day"] = dict(sorted(days.items()))
+    return agg
+
+
+def compute_projections(prog: dict, corpus_rows: int, workers: int) -> dict:
+    """Project cost + wall-time for the remaining corpus from measured done rows.
+
+    Per-row ``seconds`` is single-call latency; with W concurrent workers the
+    wall-clock is ≈ sum(seconds)/W, so we divide the projection by workers.
+    """
+    n = prog["n"]
+    per_cost = (prog["cost"] / n) if n else 0.0
+    per_lat = (prog["seconds"] / n) if n else 0.0
+    remaining = max(0, corpus_rows - n)
+    workers = max(1, workers)
+    rem_cost = remaining * per_cost
+    rem_wall = remaining * per_lat / workers
+    done_wall = prog["seconds"] / workers
+    return {
+        "done": n, "remaining": remaining, "corpus_rows": corpus_rows,
+        "per_row_cost": per_cost, "per_row_latency": per_lat, "workers": workers,
+        "done_cost": prog["cost"], "remaining_cost": rem_cost,
+        "total_cost": prog["cost"] + rem_cost,
+        "done_wall_s": done_wall, "remaining_wall_s": rem_wall,
+        "total_wall_s": done_wall + rem_wall,
+        "cost_per_1k": per_cost * 1000.0,
+    }
+
+
+def _dist_table(title: str, dist: dict, total: int) -> list[str]:
+    """Render a count/percent markdown table for a distribution dict."""
+    lines = [f"| {title} | count | share |", "|---|---:|---:|"]
+    for k, v in dist.items():
+        share = f"{v/total:.1%}" if total else "—"
+        lines.append(f"| {_md_escape(k)} | {v:,} | {share} |")
+    if not dist:
+        lines.append("| _(none)_ | 0 | — |")
+    return lines
+
+
+# ============================================================================
+# (3) Full markdown report
+# ============================================================================
+def write_full_report(per_row, lab, prog, proj, args, model, strategy_label):
+    """Assemble the comprehensive report from the labelled-set evaluation (per_row
+    + summary ``lab``), the Phase B progress ``prog`` and projections ``proj``."""
+    n = lab["n"]
+    out = args.report_out
+    L: list[str] = []
+    L.append(f"# Ontario flood labelling — full report")
+    L.append("")
+    L.append(f"_Generated {dt.datetime.now().isoformat(timespec='seconds')}._")
+    L.append("")
+    L.append(f"- **Model under analysis:** `{model}`  (strategy: {strategy_label})")
+    L.append(f"- **Hand-labelled rows scored:** {n}  "
+             f"(gold Ontario floods = {lab['tp'] + lab['fn']}, "
+             f"not-Ontario-flood = {lab['fp'] + lab['tn']})")
+    L.append(f"- **Corpus target:** {args.corpus_rows:,} rows  "
+             f"(`--corpus-rows`); already labelled = {prog['n']:,}; "
+             f"remaining = {proj['remaining']:,}")
+    L.append(f"- **Recall target:** `is_ontario_flood = flood AND ontario` "
+             f"(recall valued over precision).")
+    L.append("")
+
+    # ---- 1. headline metrics ------------------------------------------------
+    L.append("## 1. Accuracy metrics (on the hand-labelled set)")
+    L.append("")
+    L.append("| metric | value |")
+    L.append("|---|---:|")
+    L.append(f"| Recall (sensitivity) | **{lab['recall']:.3f}** |")
+    L.append(f"| Precision | {lab['precision']:.3f} |")
+    L.append(f"| Accuracy | {lab['accuracy']:.3f} |")
+    L.append(f"| F1 | {lab['f1']:.3f} |")
+    L.append(f"| F2 (recall-weighted) | {lab['f2']:.3f} |")
+    L.append(f"| Errors (unparsed rows) | {lab['errors']} |")
+    L.append(f"| Cost to score these {n} rows | ${lab['cost']:.4f} "
+             f"(${lab['cost_per_1k_rows']:.3f}/1k) |")
+    L.append("")
+    if "best" in strategy_label:
+        L.append("> ⚠️ The `best` strategy reuses the compiled few-shot prompt; a few of "
+                 "these rows may have served as demos, so these numbers are mildly "
+                 "optimistic. Use `--report-strategy zeroshot` for a clean read.")
+        L.append("")
+
+    # ---- 2. confusion matrices ---------------------------------------------
+    L.append("## 2. Confusion matrix")
+    L.append("")
+    L.append("Binary target `is_ontario_flood` (positive = a real Ontario flood):")
+    L.append("")
+    L.append("| | pred + | pred − |")
+    L.append("|---|---:|---:|")
+    L.append(f"| **actual +** | TP = {lab['tp']} | FN = {lab['fn']} |")
+    L.append(f"| **actual −** | FP = {lab['fp']} | TN = {lab['tn']} |")
+    L.append("")
+    L.append(f"- **False negatives (missed Ontario floods): {lab['fn']}** — the costly "
+             f"errors for this recall-first task.")
+    L.append(f"- False positives (over-included): {lab['fp']} — tolerated; they get "
+             f"filtered downstream.")
+    L.append("")
+    # 3-way decision breakdown (gold decision vs predicted decision)
+    decisions3 = ["ontario_flood", "flood_not_ontario", "not_flood", "error"]
+    gold3 = [r["gold_decision"] for r in per_row]
+    grid = {g: Counter() for g in ("ontario_flood", "flood_not_ontario", "not_flood")}
+    for r in per_row:
+        grid[r["gold_decision"]][(r.get("decision") or "?")] += 1
+    L.append("3-way decision breakdown (rows = gold, columns = predicted):")
+    L.append("")
+    L.append("| gold \\ pred | " + " | ".join(decisions3) + " | total |")
+    L.append("|---|" + "|".join(["---:"] * (len(decisions3) + 1)) + "|")
+    for g in ("ontario_flood", "flood_not_ontario", "not_flood"):
+        row = grid[g]
+        cells = " | ".join(str(row.get(d, 0)) for d in decisions3)
+        L.append(f"| {g} | {cells} | {sum(row.values())} |")
+    L.append("")
+
+    # ---- 3. label distribution ---------------------------------------------
+    L.append("## 3. Label distribution (hand-labelled set)")
+    L.append("")
+    L.append("Gold vs. predicted decision over the labelled rows:")
+    L.append("")
+    L += _dist_table("gold decision", lab["gold_dist"], n)
+    L.append("")
+    L += _dist_table("predicted decision", lab["pred_dist"], n)
+    L.append("")
+
+    # ---- 4. false negatives -------------------------------------------------
+    fns = [r for r in per_row if r["category"] == "fn"]
+    fps = [r for r in per_row if r["category"] == "fp"]
+    L.append(f"## 4. False negatives — missed Ontario floods ({len(fns)})")
+    L.append("")
+    L.append("These are real Ontario floods the model marked **not** an Ontario flood "
+             "— the errors that matter most. Review to tighten the prompt.")
+    L.append("")
+    if fns:
+        L.append("| id | model reason | predicted | extract |")
+        L.append("|---|---|---|---|")
+        for r in fns[: args.fn_examples]:
+            L.append(f"| {_md_escape(r['id'])} | {_md_escape(_snippet(r.get('reason'), 160))} "
+                     f"| {_md_escape(r.get('decision'))} "
+                     f"| {_md_escape(_snippet(r.get('text'), 240))} |")
+        if len(fns) > args.fn_examples:
+            L.append(f"\n_…and {len(fns) - args.fn_examples} more (see "
+                     f"`{Path(args._labeled_eval_saved).name}`)._" if getattr(args, "_labeled_eval_saved", None)
+                     else f"\n_…and {len(fns) - args.fn_examples} more._")
+    else:
+        L.append("_None — the model caught every Ontario flood in this set._")
+    L.append("")
+
+    # ---- 5. false positives -------------------------------------------------
+    L.append(f"## 5. False positives — over-included ({len(fps)})")
+    L.append("")
+    L.append("Rows flagged as Ontario floods that are not. Tolerated under the "
+             "recall-first objective, but high counts inflate downstream work.")
+    L.append("")
+    if fps:
+        L.append("| id | gold | model reason | extract |")
+        L.append("|---|---|---|---|")
+        for r in fps[: args.fp_examples]:
+            L.append(f"| {_md_escape(r['id'])} | {_md_escape(r['gold_decision'])} "
+                     f"| {_md_escape(_snippet(r.get('reason'), 160))} "
+                     f"| {_md_escape(_snippet(r.get('text'), 240))} |")
+        if len(fps) > args.fp_examples:
+            L.append(f"\n_…and {len(fps) - args.fp_examples} more._")
+    else:
+        L.append("_None._")
+    L.append("")
+
+    # ---- 6. corpus progress -------------------------------------------------
+    L.append("## 6. Corpus progress so far")
+    L.append("")
+    if prog["n"] == 0:
+        L.append(f"No predictions found yet at `{args.out}`. Run Phase B / "
+                 "`--continue-run` first to populate progress + projections.")
+        L.append("")
+    else:
+        pct = prog["n"] / args.corpus_rows if args.corpus_rows else 0
+        L.append(f"- Rows labelled: **{prog['n']:,} / {args.corpus_rows:,}** ({pct:.1%})")
+        L.append(f"- Ontario floods: {prog['ontario']:,}  |  floods elsewhere: "
+                 f"{prog['flood_not_on']:,}  |  not a flood: {prog['not_flood']:,}  "
+                 f"|  errors: {prog['errors']:,}")
+        L.append(f"- Spend so far on these rows: **${prog['cost']:.2f}**  "
+                 f"({prog['ptok'] + prog['ctok']:,} tokens)")
+        if prog["models"]:
+            L.append(f"- Model(s) used: " + ", ".join(
+                f"`{k}` ({v:,})" for k, v in prog["models"].items()))
+        if prog["by_day"]:
+            L.append(f"- Rows per day: " + ", ".join(
+                f"{k}: {v:,}" for k, v in prog["by_day"].items()))
+        L.append("")
+        L += _dist_table("predicted decision (corpus)", prog["decisions"], prog["n"])
+        L.append("")
+        if prog["flood_types"]:
+            L += _dist_table("flood type (real floods)", prog["flood_types"],
+                             sum(prog["flood_types"].values()))
+            L.append("")
+        if prog["locations"]:
+            L += _dist_table("top non-Ontario locations", prog["locations"],
+                             prog["flood_not_on"])
+            L.append("")
+
+    # ---- 7. cost & time projections ----------------------------------------
+    L.append("## 7. Cost & time projections for the remaining corpus")
+    L.append("")
+    if prog["n"] == 0:
+        lab_cost = lab["cost_per_1k_rows"] / 1000.0
+        L.append("No corpus rows labelled yet — projecting from the hand-labelled "
+                 f"run instead (~${lab['cost_per_1k_rows']:.3f}/1k rows):")
+        L.append("")
+        L.append(f"- Full {args.corpus_rows:,} rows ≈ **${lab_cost*args.corpus_rows:,.2f}** "
+                 f"at ~{lab['avg_latency_s']:.2f}s/row "
+                 f"({_hms(lab['avg_latency_s']*args.corpus_rows/max(1, args.workers))} "
+                 f"wall at {args.workers} workers).")
+        L.append("")
+    else:
+        L.append(f"Measured from the **{proj['done']:,} rows already labelled** "
+                 f"(per-row ${proj['per_row_cost']:.5f}, {proj['per_row_latency']:.2f}s; "
+                 f"wall assumes {proj['workers']} workers):")
+        L.append("")
+        L.append("| | rows | cost | wall-time |")
+        L.append("|---|---:|---:|---:|")
+        L.append(f"| Already done | {proj['done']:,} | ${proj['done_cost']:.2f} | "
+                 f"{_hms(proj['done_wall_s'])} |")
+        L.append(f"| Remaining | {proj['remaining']:,} | ${proj['remaining_cost']:.2f} | "
+                 f"{_hms(proj['remaining_wall_s'])} |")
+        L.append(f"| **Full corpus** | **{proj['corpus_rows']:,}** | "
+                 f"**${proj['total_cost']:.2f}** | **{_hms(proj['total_wall_s'])}** |")
+        L.append("")
+        L.append(f"- Effective rate: **${proj['cost_per_1k']:.3f}/1k rows**.")
+        L.append(f"- To finish in one go: `python tdm_overnight.py --continue-run "
+                 f"--ignore-budget` (≈ ${proj['remaining_cost']:.2f} more).")
+        lab_per_row = (lab["cost"] / lab["n"]) if lab["n"] else 0.0
+        if lab_per_row > 0 and proj["per_row_cost"] > 0:
+            L.append(f"- Cross-check: hand-labelled per-row cost ${lab_per_row:.5f} vs "
+                     f"corpus ${proj['per_row_cost']:.5f} "
+                     f"({proj['per_row_cost']/lab_per_row:.2f}× — extracts run longer/"
+                     f"shorter than the labelled snippets).")
+        L.append("")
+
+    # ---- 8. optional: Phase A leaderboard -----------------------------------
+    lb_path = ARTIFACTS_DIR / "prompt_eval_report.json"
+    if lb_path.exists():
+        try:
+            board = json.load(open(lb_path)).get("candidates", [])
+        except Exception:
+            board = []
+        if board:
+            L.append("## 8. Prompt-selection leaderboard (Phase A)")
+            L.append("")
+            L.append("| model | strategy | recall | precision | F2 | $/1k | full corpus $ | fits? |")
+            L.append("|---|---|---:|---:|---:|---:|---:|:--:|")
+            for m in board:
+                L.append(f"| {m.get('model')} | {m.get('strategy')} | "
+                         f"{m.get('recall', 0):.3f} | {m.get('precision', 0):.3f} | "
+                         f"{m.get('f2', 0):.3f} | ${m.get('cost_per_1k_rows', 0):.3f} | "
+                         f"${m.get('full_corpus_cost', 0):.2f} | "
+                         f"{'✅' if m.get('affordable') else '❌'} |")
+            L.append("")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(L) + "\n", encoding="utf-8")
+
+    # machine-readable companion
+    json_out = out.with_suffix(".json")
+    json_out.write_text(json.dumps({
+        "generated": dt.datetime.now().isoformat(timespec="seconds"),
+        "model": model, "strategy": strategy_label,
+        "labeled": {k: v for k, v in lab.items()},
+        "corpus_progress": prog, "projections": proj,
+        "false_negatives": [{k: r.get(k) for k in
+                             ("id", "gold_decision", "decision", "reason", "flood_location")}
+                            for r in fns],
+        "false_positives": [{k: r.get(k) for k in
+                             ("id", "gold_decision", "decision", "reason", "flood_location")}
+                            for r in fps],
+    }, indent=2), encoding="utf-8")
+    return out, json_out
+
+
+def run_report(args, api_key):
+    """Mode (3): generate the full markdown report."""
+    print("=" * 78)
+    print("FULL REPORT")
+    print("=" * 78)
+
+    # 1) predictions on the 250 — reuse a saved eval, else run the chosen model.
+    if args.reuse_eval:
+        if not Path(args.reuse_eval).exists():
+            raise SystemExit(f"--reuse-eval file not found: {args.reuse_eval}")
+        per_row = load_labeled_eval_jsonl(args.reuse_eval)
+        if not per_row:
+            raise SystemExit(f"--reuse-eval file is empty: {args.reuse_eval}")
+        model = per_row[0].get("model", "?")
+        strategy_label = "reused predictions"
+        args._labeled_eval_saved = str(args.reuse_eval)
+        lab = summarize_labeled(per_row, model, args)
+        print(f"[report] reused {len(per_row)} labelled predictions from {args.reuse_eval} "
+              f"(model={model}).")
+    else:
+        rows = load_annotations(args.annotations)
+        program, model, strategy_label = get_labeled_program(args, api_key)
+        print(f"[report] scoring {len(rows)} hand-labelled rows with '{model}' "
+              f"({strategy_label}); workers={args.eval_workers}…")
+        lab, per_row = run_on_labeled(program, rows, model, args)
+        save_path = labeled_eval_path(model, args.report_strategy)
+        write_labeled_eval_jsonl(save_path, per_row)
+        args._labeled_eval_saved = str(save_path)
+        print(f"[report] per-row predictions -> {save_path}")
+
+    print(f"[report] recall={lab['recall']:.3f} precision={lab['precision']:.3f} "
+          f"acc={lab['accuracy']:.3f} | TP={lab['tp']} FP={lab['fp']} "
+          f"FN={lab['fn']} TN={lab['tn']} | ${lab['cost']:.4f}")
+
+    # 2) corpus progress + projections (folds in the rows already labelled)
+    prog = phaseB_progress(args.out)
+    proj = compute_projections(prog, args.corpus_rows, args.workers)
+    if prog["n"]:
+        print(f"[report] corpus: {prog['n']:,} done (${prog['cost']:.2f}); "
+              f"remaining {proj['remaining']:,} ≈ ${proj['remaining_cost']:.2f}, "
+              f"{_hms(proj['remaining_wall_s'])} wall.")
+
+    md, js = write_full_report(per_row, lab, prog, proj, args, model, strategy_label)
+    print(f"\n[report] wrote {md}\n[report] wrote {js}")
+
+
+# ============================================================================
+# (2) Test more models / configs on the hand-labelled set
+# ============================================================================
+def _expand_configs(args):
+    """Cartesian sweep of (model, strategy, temperature, reasoning_effort).
+
+    Effort only varies reasoning models; temperature only varies non-reasoning
+    models — anything else is collapsed so the board has no meaningless dupes.
+    """
+    models = [canonical_model(m) for m in args.models]
+    efforts = args.reasoning_efforts or [args.reasoning_effort]
+    temps = args.temperatures or [args.temperature]
+    seen, configs = set(), []
+    for model in models:
+        reasoning = is_reasoning_model(model)
+        for strat in args.strategies:
+            for eff in (efforts if reasoning else [args.reasoning_effort]):
+                for temp in ([1.0] if reasoning else temps):
+                    key = (model, strat, eff if reasoning else None,
+                           None if reasoning else temp)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    configs.append({"model": model, "strategy": strat,
+                                    "temperature": temp, "reasoning_effort": eff,
+                                    "reasoning": reasoning})
+    return configs
+
+
+def run_test_models(args, api_key):
+    """Mode (2): benchmark several models/configs on the 250 hand-labelled rows."""
+    print("=" * 78)
+    print("TEST MODELS / CONFIGS  (on the hand-labelled set)")
+    print("=" * 78)
+    rows = load_annotations(args.annotations)
+    n_pos = sum(r["is_ontario_flood"] for r in rows)
+    print(f"[test] {len(rows)} labelled rows ({n_pos} Ontario floods).")
+
+    if args.eval_on_full:
+        eval_rows, train_rows = rows, rows
+        print("[test] evaluating on ALL labelled rows (--eval-on-full); fewshot demos "
+              "are bootstrapped from the same rows (mildly optimistic for fewshot).")
+    else:
+        train_rows, eval_rows = stratified_split(rows, args.eval_frac, args.seed)
+        print(f"[test] train={len(train_rows)} eval={len(eval_rows)} "
+              f"(held-out, stratified, seed={args.seed}).")
+    train_ex = to_examples(train_rows)
+
+    configs = _expand_configs(args)
+    print(f"[test] {len(configs)} config(s): "
+          f"models={[canonical_model(m) for m in args.models]} strategies={args.strategies} "
+          f"efforts={args.reasoning_efforts or [args.reasoning_effort]} "
+          f"temps={args.temperatures or [args.temperature]}\n")
+
+    results = []
+    probed_ok: dict[str, bool] = {}
+    for cfg in configs:
+        model, strat = cfg["model"], cfg["strategy"]
+        cargs = _clone_args(args, temperature=cfg["temperature"],
+                            reasoning_effort=cfg["reasoning_effort"])
+        eff = cfg["reasoning_effort"] if cfg["reasoning"] else f"t={cfg['temperature']}"
+        tag = f"{model} :: {strat} :: {eff}"
+        # probe each distinct model once so an unreachable one is skipped cleanly
+        if model not in probed_ok:
+            try:
+                lm = build_lm(model, cargs, api_key)
+                probe = make_program("predict")
+                probe.set_lm(lm)
+                _ = probe(article_text="The Grand River overflowed its banks at Galt, "
+                                       "Ontario, flooding homes.")
+                probed_ok[model] = True
+            except Exception as e:
+                probed_ok[model] = False
+                print(f"[test] SKIP model '{model}': {type(e).__name__}: {str(e)[:140]}")
+        if not probed_ok[model]:
+            continue
+        try:
+            lm = build_lm(model, cargs, api_key)
+            program = make_program("cot" if strat == "cot" else "predict")
+            program.set_lm(lm)
+            if strat == "fewshot":
+                with dspy.context(lm=lm):
+                    program = compile_fewshot(program, train_ex, cargs)
+                program.set_lm(lm)
+            lab, per_row = run_on_labeled(program, eval_rows, model, cargs)
+            save_path = labeled_eval_path(model, f"{strat}-{eff}")
+            write_labeled_eval_jsonl(save_path, per_row)
+            lab.update({"tag": tag, "strategy": strat, "config": eff,
+                        "affordable": lab["full_corpus_cost"] <= args.budget * args.budget_safety,
+                        "pred_path": str(save_path)})
+            results.append(lab)
+            print(f"  [{tag:<34}] R={lab['recall']:.3f} P={lab['precision']:.3f} "
+                  f"F2={lab['f2']:.3f} acc={lab['accuracy']:.3f} FN={lab['fn']} FP={lab['fp']} "
+                  f"${lab['cost_per_1k_rows']:.3f}/1k corpus=${lab['full_corpus_cost']:.2f}")
+        except Exception as e:
+            print(f"  [{tag}] FAILED: {type(e).__name__}: {str(e)[:160]}")
+
+    if not results:
+        raise SystemExit("[test] no config produced metrics — check proxy/models.")
+    results.sort(key=lambda m: (m["f2"], m["recall"], -m["cost_per_1k_rows"]), reverse=True)
+    write_model_test_report(results, eval_rows, args)
+
+
+def write_model_test_report(results, eval_rows, args):
+    n = len(eval_rows)
+    n_pos = sum(r["is_ontario_flood"] for r in eval_rows)
+    L = ["# Model / config benchmark — hand-labelled set", "",
+         f"_Generated {dt.datetime.now().isoformat(timespec='seconds')}._", "",
+         f"- Evaluated on **{n}** labelled rows ({n_pos} Ontario floods, {n-n_pos} not).",
+         f"- Scope: {'ALL rows (--eval-on-full)' if args.eval_on_full else f'held-out split (eval-frac={args.eval_frac})'}.",
+         "- Ranked by **F2** (recall-weighted) → recall → cheaper.",
+         f"- Corpus sizing: full = {args.corpus_rows:,} rows; "
+         f"'fits?' = full-corpus cost ≤ ${args.budget*args.budget_safety:.0f}.", "",
+         "| rank | model | strategy | config | recall | precision | acc | F1 | F2 | FN | FP | $/1k | full corpus $ | fits? |",
+         "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|"]
+    for i, m in enumerate(results, 1):
+        L.append(f"| {i} | {m['model']} | {m['strategy']} | {m['config']} | "
+                 f"{m['recall']:.3f} | {m['precision']:.3f} | {m['accuracy']:.3f} | "
+                 f"{m['f1']:.3f} | {m['f2']:.3f} | {m['fn']} | {m['fp']} | "
+                 f"${m['cost_per_1k_rows']:.3f} | ${m['full_corpus_cost']:.2f} | "
+                 f"{'✅' if m['affordable'] else '❌'} |")
+    best = results[0]
+    L += ["", "## Best config", "",
+          f"**{best['tag']}** — recall {best['recall']:.3f}, precision {best['precision']:.3f}, "
+          f"F2 {best['f2']:.3f}, {best['fn']} missed floods, "
+          f"~${best['cost_per_1k_rows']:.3f}/1k rows (≈ ${best['full_corpus_cost']:.2f} "
+          f"for the full {args.corpus_rows:,}-row corpus).", "",
+          "Per-row predictions for each config are saved alongside this report "
+          "(`artifacts/labeled_eval__*.jsonl`); feed one to "
+          "`--report --reuse-eval <path>` for its full FP/FN breakdown.", ""]
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    md = ARTIFACTS_DIR / "model_test_report.md"
+    md.write_text("\n".join(L) + "\n", encoding="utf-8")
+    (ARTIFACTS_DIR / "model_test_report.json").write_text(
+        json.dumps({"eval_size": n, "eval_on_full": args.eval_on_full,
+                    "corpus_rows": args.corpus_rows,
+                    "results": [{k: v for k, v in m.items()} for m in results]},
+                   indent=2), encoding="utf-8")
+    print(f"\n[test] wrote {md} and .json  (best: {best['tag']})")
 
 
 # ============================================================================
@@ -1297,6 +2025,18 @@ def run_self_test(args):
     args.price_in = 0.001
     args.price_out = 0.002
     args.optimize_budget = 50.0
+    # new-mode knobs (defaults exist via argparse; set explicitly for the test)
+    args.report_out = tmp / "full_report.md"
+    args.reuse_eval = None
+    args.report_model = None
+    args.report_strategy = "best"
+    args.fp_examples = 10
+    args.fn_examples = 10
+    args.eval_on_full = True
+    args.reasoning_efforts = None
+    args.temperatures = None
+    args.continue_run = False
+    args.ignore_budget = False
 
     print("=== SELF-TEST (DummyLM, no network) ===")
     program, model, spent = phase_optimize(args, api_key="dummy", remaining_budget=100.0)
@@ -1315,8 +2055,41 @@ def run_self_test(args):
     # daily-spend re-read works
     _a, _b, tot = today_spend(args)
     assert tot > 0, "today_spend did not pick up ledger + predictions"
-    print(f"\nSELF-TEST PASSED ✅  ({len(rdr)} rows labelled; columns OK; report+best+ledger saved)")
+
+    # ---- (3) --report : metrics + confusion + FP/FN + projections --------
+    print("\n=== SELF-TEST: --report ===")
+    run_report(args, api_key="dummy")
+    assert args.report_out.exists(), "report markdown not written"
+    assert args.report_out.with_suffix(".json").exists(), "report json not written"
+    rpt = args.report_out.read_text()
+    for needle in ("Confusion matrix", "False negatives", "projections", "Recall"):
+        assert needle in rpt, f"report missing section: {needle!r}"
+    rj = json.load(open(args.report_out.with_suffix(".json")))
+    assert "projections" in rj and "labeled" in rj, "report json missing keys"
+
+    # report can reuse the saved per-row predictions without any LM calls
+    print("\n=== SELF-TEST: --report --reuse-eval ===")
+    reuse_args = _clone_args(args, reuse_eval=Path(args._labeled_eval_saved),
+                             report_out=tmp / "full_report_reuse.md")
+    run_report(reuse_args, api_key="dummy")
+    assert reuse_args.report_out.exists(), "reuse-eval report not written"
+
+    # ---- (2) --test-models : multi-config benchmark on the 250 -----------
+    print("\n=== SELF-TEST: --test-models ===")
+    run_test_models(args, api_key="dummy")
+    assert (ARTIFACTS_DIR / "model_test_report.md").exists(), "model test report not written"
+    mt = json.load(open(ARTIFACTS_DIR / "model_test_report.json"))
+    assert mt["results"], "model test produced no results"
+
+    # ---- (1) --continue-run --ignore-budget : resume sizing path ---------
+    print("\n=== SELF-TEST: --continue-run --ignore-budget (resume, corpus done) ===")
+    cont_args = _clone_args(args, ignore_budget=True)
+    phase_run(program, model, spent, cont_args, api_key="dummy")  # all done -> 0 new rows
+
+    print(f"\nSELF-TEST PASSED ✅  ({len(rdr)} rows labelled; columns OK; "
+          f"report+test-models+best+ledger saved)")
     print(f"  today_spend re-read: A=${_a:.4f} B=${_b:.4f} total=${tot:.4f}")
+    print(f"  full report: {args.report_out}")
     print(f"  scratch dir: {tmp}")
     _LM_FACTORY = None
 
@@ -1388,6 +2161,48 @@ def build_parser():
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--self-test", action="store_true", help="offline mechanical test (DummyLM)")
     p.add_argument("--verbose", action="store_true")
+
+    # (1) continue labelling the leftover corpus -----------------------------
+    p.add_argument("--continue-run", action="store_true",
+                   help="(1) skip Phase A, load the saved best prompt, and keep labelling the "
+                        "leftover unlabelled rows (resumes from the JSONL checkpoint)")
+    p.add_argument("--ignore-budget", action="store_true",
+                   help="bypass the daily $ cap and size Phase B to the remaining corpus "
+                        "(use with --continue-run to finish all 91k in one go)")
+
+    # (2) benchmark more models/configs on the labelled set ------------------
+    p.add_argument("--test-models", action="store_true",
+                   help="(2) evaluate --models x --strategies x configs on the hand-labelled "
+                        "rows and write artifacts/model_test_report.{md,json}; no corpus run")
+    p.add_argument("--eval-on-full", action="store_true",
+                   help="for --test-models: score ALL labelled rows instead of a held-out split")
+    p.add_argument("--reasoning-efforts", type=lambda s: [x for x in s.split(",") if x],
+                   default=None, help="for --test-models: sweep these efforts on reasoning models "
+                                      "(e.g. minimal,low,medium)")
+    p.add_argument("--temperatures", type=lambda s: [float(x) for x in s.split(",") if x],
+                   default=None, help="for --test-models: sweep these temperatures on non-reasoning models")
+
+    # (3) full markdown report ----------------------------------------------
+    p.add_argument("--report", action="store_true",
+                   help="(3) write a full markdown report: metrics, confusion matrices, "
+                        "distributions, FP/FN analysis on the labelled set, and cost/time "
+                        "projections for the remaining corpus (folding in rows already done)")
+    p.add_argument("--report-model", default=None,
+                   help="model to score the labelled set for the report (default: saved best, "
+                        "else first of --models)")
+    p.add_argument("--report-strategy", default="best", choices=["best", "zeroshot", "cot"],
+                   help="'best' reuses the compiled prompt actually labelling the corpus; "
+                        "'zeroshot'/'cot' build a fresh program for a clean read")
+    p.add_argument("--reuse-eval", type=Path, default=None,
+                   help="for --report: load existing per-row labelled predictions (a "
+                        "labeled_eval__*.jsonl from a prior --report/--test-models) instead "
+                        "of re-scoring (no LM spend)")
+    p.add_argument("--report-out", type=Path, default=ARTIFACTS_DIR / "full_report.md",
+                   help="output path for the --report markdown")
+    p.add_argument("--fp-examples", type=int, default=15,
+                   help="max false-positive examples to list in the report")
+    p.add_argument("--fn-examples", type=int, default=25,
+                   help="max false-negative examples to list in the report")
     return p
 
 
@@ -1430,15 +2245,34 @@ def main():
 
     _load_tdm_pricing()
     configure_dspy()  # track usage + single-call json_object adapter
+
+    # Read-only-ish modes that don't run the corpus: dispatch before the budget
+    # gate so they work even when today's cap is already spent. The auth token is
+    # read lazily so '--report --reuse-eval' regenerates a report fully offline.
+    if args.test_models:
+        run_test_models(args, read_api_key(args))
+        return
+    if args.report:
+        run_report(args, None if args.reuse_eval else read_api_key(args))
+        return
+
     api_key = read_api_key(args)
+
+    # --continue-run = reuse the saved prompt and keep labelling the leftover.
+    if args.continue_run:
+        args.skip_optimize = True
 
     # Re-read the log: how much of today's budget is already gone (prior runs)?
     spent_A, spent_B, already = today_spend(args)
     remaining = max(0.0, args.budget - already)
 
+    mode = ("CONTINUE leftover corpus" if args.continue_run else
+            "RELABEL (reuse saved)" if (args.skip_optimize or args.reuse_best) else
+            "OPTIMIZE + LABEL")
     print("=" * 78)
     print("TDM OVERNIGHT FLOOD LABELLER")
     print("=" * 78)
+    print(f"  mode          : {mode}{'  (--ignore-budget)' if args.ignore_budget else ''}")
     print(f"  budget        : ${args.budget:.2f}/day   (today already spent ${already:.4f}: "
           f"A=${spent_A:.4f} B=${spent_B:.4f})")
     print(f"  remaining     : ${remaining:.4f}")
@@ -1450,8 +2284,9 @@ def main():
     print(f"  proxy         : {args.base_url}")
     print(f"  ledger        : {args.ledger}")
 
-    if remaining <= 0.01:
-        print("\n[stop] today's budget is exhausted. Re-run tomorrow (the ledger resets by day).")
+    if remaining <= 0.01 and not args.ignore_budget:
+        print("\n[stop] today's budget is exhausted. Re-run tomorrow (the ledger resets by day), "
+              "or pass --ignore-budget (with --continue-run) to push through the rest now.")
         return
 
     spent_thisrun = 0.0
