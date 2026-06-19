@@ -1,0 +1,18 @@
+{
+  "comment": [
+    "Drop-in for /etc/docker/daemon.json to keep Docker OFF the cluster's red",
+    "network range. Per UofT CS support, Docker's default bridge subnet",
+    "conflicts with the red range and causes unpredictable failures. These",
+    "address pools confine every bridge network Docker creates to the reserved",
+    "docker1/docker2/docker3 ranges (192.168.152-154.0/24). Requires control of",
+    "the docker daemon; restart dockerd after installing. If you have no admin",
+    "rights, use the per-network approach in run_docker_ollama.sh instead.",
+    "Remove this 'comment' key before use — daemon.json does not allow comments."
+  ],
+  "default-address-pools": [
+    { "base": "192.168.152.0/24", "size": 24 },
+    { "base": "192.168.153.0/24", "size": 24 },
+    { "base": "192.168.154.0/24", "size": 24 }
+  ],
+  "bip": "192.168.152.1/24"
+}

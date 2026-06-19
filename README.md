@@ -262,6 +262,18 @@ Operational details:
   `scripts/model_pricing.py` (with a sanity guard), else a built-in table;
   override exactly with `--price-in`/`--price-out`.
 
+## Cluster step: local-LLM detail extraction (`cluster/`)
+
+After the TDM run filters the corpus down to Ontario floods, the
+[`cluster/`](cluster/) folder runs a **local LLM (Ollama) on the UofT CS SLURM
+cluster** to extract finer per-article detail — event date, flood type,
+location, water body, cause, and impact (deaths, injuries, displaced, damage,
+infrastructure). It's self-contained (no internet/API/spend on the compute
+node), checkpointed/resumable, and installs Ollama into `$HOME` with no admin
+rights. See [`cluster/README.md`](cluster/README.md) for the full workflow
+(login-node setup, `sbatch slurm_extract.sbatch`, and the Docker network-range
+caveat).
+
 ## Project layout
 
 ```
@@ -272,6 +284,11 @@ src/
   optimize.py     # Compile better filter prompts from labelled data
   run_inference.py    # Batch the local (Ollama) pipeline over extracts
   tdm_overnight.py    # One-shot TDM job: optimize -> top-3 report -> budgeted labelling
+cluster/          # Local-LLM (Ollama) detail extraction on the UofT CS SLURM cluster
+  extract_floods.py   # DSPy + local Ollama: extract date/type/impact per Ontario flood
+  env.sh / start_ollama.sh / install_ollama.sh  # home-dir Ollama setup (no admin)
+  slurm_extract.sbatch  # GPU job: start Ollama -> extract -> stop
+  docker/             # Optional Docker path pinned to reserved network ranges
 data/
   raw/            # Input OCR text + annotations_so_far.csv (git-ignored)
   processed/      # Pipeline output (git-ignored)
